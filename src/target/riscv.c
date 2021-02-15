@@ -505,9 +505,14 @@ void riscv_jtag_handler(uint8_t jd_index, uint32_t j_idcode)
 	DEBUG("dtmcontrol = 0x%08x\n", dtmcontrol);
 	uint8_t version = dtmcontrol & 0xf;
 
-	if (version > 0) {
-		DEBUG("Only DTM version 0 handle. Version is %d\n", version);
-// FIXME		return; /* We'll come back to this someday */
+	switch (version) {
+	case 0: break;
+	case 1:
+		DEBUG("Risc-V Debug 0.13.x is *very* experimental.\n");
+		break;
+	default:
+		DEBUG("Unsupported Risc-V Debug spec. Version is %d\n", version);
+		return;
 	}
 
 	struct riscv_dtm *dtm = alloca(sizeof(*dtm));
