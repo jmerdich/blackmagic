@@ -435,20 +435,19 @@ void riscv_jtag_handler(uint8_t jd_index, uint32_t j_idcode)
 		return;
 	}
 
-	struct riscv_dtm *dtm = alloca(sizeof(*dtm));
-	memset(dtm, 0, sizeof(*dtm));
-	dtm->dtm_index = jd_index;
-	dtm->abits = ((dtmcontrol >> 13) & 3) << 4 |
-	              ((dtmcontrol >> 4) & 0xf);
-	dtm->idle = (dtmcontrol >> 10) & 7;
-	DEBUG("abits = %d\n", dtm->abits);
-	DEBUG("idle = %d\n", dtm->idle);
+	struct riscv_dtm dtm = {};
+	dtm.dtm_index = jd_index;
+	dtm.abits = ((dtmcontrol >> 13) & 3) << 4 |
+	            ((dtmcontrol >> 4) & 0xf);
+	dtm.idle = (dtmcontrol >> 10) & 7;
+	DEBUG("abits = %d\n", dtm.abits);
+	DEBUG("idle = %d\n", dtm.idle);
 	DEBUG("dbusstat = %d\n", (dtmcontrol >> 8) & 3);
-	riscv_dtm_reset(dtm);
+	riscv_dtm_reset(&dtm);
 
 	jtag_dev_write_ir(&jtag_proc, jd_index, IR_DMI);
 
-	uint32_t dminfo = riscv_dtm_read(dtm, DBUS_011_DMINFO);
+	uint32_t dminfo = riscv_dtm_read(&dtm, DBUS_011_DMINFO);
 	DEBUG("dminfo = %"PRIx32"\n", dminfo);
 	uint8_t dmversion = ((dminfo >> 4) & 0xc) | (dminfo & 3);
 	DEBUG("dminfo = %"PRIx32"\n", dminfo);
@@ -462,25 +461,32 @@ void riscv_jtag_handler(uint8_t jd_index, uint32_t j_idcode)
 		return;
 
 #if defined(ENABLE_DEBUG) && defined(PLATFORM_HAS_DEBUG)
-	dtm->dramsize = (dminfo >> 10) & 0x3f;
-	DEBUG("\tdramsize = %d (%d bytes)\n", dtm->dramsize, (dtm->dramsize + 1) * 4);
+	dtm.dramsize = (dminfo >> 10) & 0x3f;
+	DEBUG("\tdramsize = %d (%d bytes)\n", dtm.dramsize, (dtm.dramsize + 1) * 4);
 
-	riscv_dtm_write(dtm, 0, 0xbeefcafe);
-	riscv_dtm_write(dtm, 1, 0xdeadbeef);
-	DEBUG("%"PRIx32"\n", (uint32_t)riscv_dtm_read(dtm, 0));
-	DEBUG("%"PRIx32"\n", (uint32_t)riscv_dtm_read(dtm, 1));
-	for (int i = 0; i < 	dtm->dramsize + 1; i++) {
+	riscv_dtm_write(&dtm, 0, 0xbeefcafe);
+	riscv_dtm_write(&dtm, 1, 0xdeadbeef);
+	DEBUG("%"PRIx32"\n", (uint32_t)riscv_dtm_read(&dtm, 0));
+	DEBUG("%"PRIx32"\n", (uint32_t)riscv_dtm_read(&dtm, 1));
+	for (int i = 0; i < 	dtm.dramsize + 1; i++) {
 		DEBUG("DebugRAM[%d] = %08"PRIx64"\n", i,
-			  riscv_dtm_read(dtm, 0x400 + i*4));
+			  riscv_dtm_read(&dtm, 0x400 + i*4));
 	}
 #else
 	(void)riscv_dtm_write;
 #endif
 	/* Allocate and set up new target */
+	struct riscv_dtm* saved_dtm = malloc(sizeof(dtm));
+	if (!saved_dtm) {
+		return;
+	}
 	target *t = target_new();
-	t->priv = malloc(sizeof(*dtm));
-	memcpy(t->priv, dtm, sizeof(*dtm));
-	dtm = t->priv;
+	if (!t) {
+		free(saved_dtm);
+		return;
+	}
+	t->priv = saved_dtm;
+	memcpy(t->priv, &dtm, sizeof(dtm));
 	t->priv_free = free;
 	t->driver = "RISC-V";
 	t->mem_read = riscv_mem_read;
