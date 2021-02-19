@@ -172,3 +172,5 @@ struct riscv_dtm {
 	bool halt_requested;
 	uint32_t saved_s1;
 };
+
+extern bool riscv_011_init(uint8_t jd_index, uint32_t idcode, uint32_t dtmcontrol);
