@@ -29,12 +29,74 @@
 #include "jtag_scan.h"
 #include "target.h"
 #include "target_internal.h"
-#include "riscv_common.h"
+#include "riscv.h"
+
+
+#define IR_IDCODE     0x01
+#define IR_DTMCONTROL 0x10
+#define IR_DBUS       0x11
+#define IR_BYPASS     0x1f
+
+#define DTMCONTROL_DBUSRESET (1 << 16)
+
+#define DBUS_NOP   0
+#define DBUS_READ  1
+#define DBUS_WRITE 2
+
+#define DBUS_DMCONTROL 0x10
+#define DBUS_DMINFO    0x11
+
+#define DMCONTROL_INTERRUPT (1ull << 33)
+#define DMCONTROL_HALTNOT (1ull << 32)
+
+#define OP_ITYPE(opcode, funct, rd, imm, rs1) \
+                 ((opcode) | ((funct) << 12) | ((rd) << 7) | ((rs1) << 15) | ((imm) << 20))
+#define OP_STYPE(opcode, funct, rs1, imm, rs2) \
+                 ((opcode) | ((funct) << 12) | ((rs1) << 15) | ((rs2) << 20) | \
+		  (((imm) & 0x1f) << 7) | (((imm) & 0xfe0) << 20))
+#define OPCODE_LOAD   0x03
+#define OPCODE_STORE  0x23
+#define OPCODE_OP_IMM 0x13
+#define OPCODE_JUMP   0x6f
+#define OP_ADDI       0
+#define LB(rd, imm, base) OP_ITYPE(OPCODE_LOAD, 0, rd, imm, base)
+#define LH(rd, imm, base) OP_ITYPE(OPCODE_LOAD, 1, rd, imm, base)
+#define LW(rd, imm, base) OP_ITYPE(OPCODE_LOAD, 2, rd, imm, base)
+#define SB(rs, imm, base) OP_STYPE(OPCODE_STORE, 0, base, imm, rs)
+#define SH(rs, imm, base) OP_STYPE(OPCODE_STORE, 1, base, imm, rs)
+#define SW(rs, imm, base) OP_STYPE(OPCODE_STORE, 2, base, imm, rs)
+#define J(imm)            (OPCODE_JUMP | ((imm) << 20))
+#define ADDI(rd, rs, imm) OP_ITYPE(OPCODE_OP_IMM, OP_ADDI, rd, imm, rs)
+#define S0 8
+#define S1 9
+#define T0 5
+#define JRESUME(n)        (J(0x804 - (0x400 + ((n) * 4))))
+
+#define CSR_TSELECT  0x7a0
+#define CSR_MCONTROL 0x7a1
+#define CSR_TDATA2   0x7a2
+
+#define CSR_DCSR     0x7b0
+#define CSR_DPC      0x7b1
+#define CSR_DSCRATCH 0x7b2
+
+#define CSR_MCONTROL_DMODE        (1<<(32-5))
+#define CSR_MCONTROL_ENABLE_MASK  (0xf << 3)
+#define CSR_MCONTROL_R            (1 << 0)
+#define CSR_MCONTROL_W            (1 << 1)
+#define CSR_MCONTROL_X            (1 << 2)
+#define CSR_MCONTROL_RW           (CSR_MCONTROL_R | CSR_MCONTROL_W)
+#define CSR_MCONTROL_RWX          (CSR_MCONTROL_RW | CSR_MCONTROL_X)
+#define CSR_MCONTROL_ACTION_DEBUG (1 << 12)
+
+#define CSR_DCSR_STEP    (1 << 2)
+#define CSR_DCSR_HALT    (1 << 3)
+#define CSR_DCSR_NDRESET (1 << 29)
 
 static void riscv_dtm_reset(struct riscv_dtm *dtm)
 {
-	jtag_dev_write_ir(&jtag_proc, dtm->dtm_index, IR_DTMCS);
-	uint32_t dtmcontrol = DTMCS_DMIRESET_MASK;
+	jtag_dev_write_ir(&jtag_proc, dtm->dtm_index, IR_DTMCONTROL);
+	uint32_t dtmcontrol = DTMCONTROL_DBUSRESET;
 	jtag_dev_shift_dr(&jtag_proc, dtm->dtm_index, (void*)&dtmcontrol, (void*)&dtmcontrol, 32);
 	DEBUG("after dbusreset: dtmcontrol = 0x%08x\n", dtmcontrol);
 }
@@ -57,7 +119,7 @@ retry:
 	switch (ret & 3) {
 	case 3:
 		riscv_dtm_reset(dtm);
-		jtag_dev_write_ir(&jtag_proc, dtm->dtm_index, IR_DMI);
+		jtag_dev_write_ir(&jtag_proc, dtm->dtm_index, IR_DBUS);
 		DEBUG("retry out %"PRIx64"\n", dbus);
 		jtag_dev_shift_dr(&jtag_proc, dtm->dtm_index,
 		                  (void*)&ret, (const void*)&dtm->lastdbus,
@@ -81,27 +143,27 @@ retry:
 static void riscv_dtm_write(struct riscv_dtm *dtm, uint32_t addr, uint64_t data)
 {
 	uint64_t dbus = ((uint64_t)addr << 36) |
-	                ((data & 0x3ffffffffull) << 2) | DMI_OP_WRITE;
+	                ((data & 0x3ffffffffull) << 2) | DBUS_WRITE;
 	riscv_dtm_low_access(dtm, dbus);
 }
 
 static uint64_t riscv_dtm_read(struct riscv_dtm *dtm, uint32_t addr)
 {
-	riscv_dtm_low_access(dtm, ((uint64_t)addr << 36) | DMI_OP_READ);
-	return riscv_dtm_low_access(dtm, DMI_OP_NOP);
+	riscv_dtm_low_access(dtm, ((uint64_t)addr << 36) | DBUS_READ);
+	return riscv_dtm_low_access(dtm, DBUS_NOP);
 }
 
 static void ram_stub_write(struct riscv_dtm *dtm, int i, uint32_t inst, bool run)
 {
-	riscv_dtm_write(dtm, i, run ? DMCONTROL_011_INTERRUPT | inst : inst);
+	riscv_dtm_write(dtm, i, run ? DMCONTROL_INTERRUPT | inst : inst);
 }
 
 static uint32_t ram_stub_result(struct riscv_dtm *dtm, int i)
 {
 	uint64_t ex;
 	do {
-		ex = riscv_dtm_read(dtm, dtm->dramsize);
-	} while (ex & DMCONTROL_011_INTERRUPT);
+		ex = riscv_dtm_read(dtm, dtm->v011.dramsize);
+	} while (ex & DMCONTROL_INTERRUPT);
 	if ((uint32_t)ex != 0) {
 		DEBUG("%s exception 0x%"PRIx32"\n", __func__, (uint32_t)ex);
 		dtm->exception = true;
@@ -193,7 +255,7 @@ static void riscv_halt_resume(target *t, bool step)
 {
 	DEBUG("Resume requested! step=%d\n", step);
 	struct riscv_dtm *dtm = t->priv;
-	riscv_dtm_write(dtm, dtm->dramsize, dtm->saved_s1);
+	riscv_dtm_write(dtm, dtm->v011.dramsize, dtm->saved_s1);
 	/* Debug RAM stub - we patch in step bit as needed
 	 * 400:   7b006073   csrsi dcsr, 0
 	 * 404:   7b047073   csrci dcsr, halt
@@ -387,9 +449,9 @@ static enum target_halt_reason riscv_halt_poll(target *t, target_addr *watch)
 {
 	(void)watch;
 	struct riscv_dtm *dtm = t->priv;
-	uint64_t dmcontrol = riscv_dtm_read(dtm, DBUS_011_DMCONTROL);
+	uint64_t dmcontrol = riscv_dtm_read(dtm, DBUS_DMCONTROL);
 	DEBUG("dmcontrol = 0x%"PRIx64"\n", dmcontrol);
-	if (!dtm->halt_requested && (dmcontrol & DMCONTROL_011_HALTNOT) == 0)
+	if (!dtm->halt_requested && (dmcontrol & DMCONTROL_HALTNOT) == 0)
 		return TARGET_HALT_RUNNING;
 
 	uint32_t dcsr = riscv_csreg_read(dtm, CSR_DCSR);
@@ -397,7 +459,7 @@ static enum target_halt_reason riscv_halt_poll(target *t, target_addr *watch)
 	DEBUG("cause = %d\n", cause);
 	if (cause == 0)
 		return TARGET_HALT_RUNNING;
-	dtm->saved_s1 = riscv_dtm_read(dtm, dtm->dramsize);
+	dtm->saved_s1 = riscv_dtm_read(dtm, dtm->v011.dramsize);
 	switch (cause) {
 	case 1: /* Software breakpoint */
 	case 2: /* Hardware trigger breakpoint */
@@ -488,9 +550,9 @@ bool riscv_011_init(uint8_t jd_index, uint32_t idcode, uint32_t dtmcontrol) {
 	DEBUG("dbusstat = %d\n", (dtmcontrol >> 8) & 3);
 	riscv_dtm_reset(&dtm);
 
-	jtag_dev_write_ir(&jtag_proc, jd_index, IR_DMI);
+	jtag_dev_write_ir(&jtag_proc, jd_index, IR_DBUS);
 
-	uint32_t dminfo = riscv_dtm_read(&dtm, DBUS_011_DMINFO);
+	uint32_t dminfo = riscv_dtm_read(&dtm, DBUS_DMINFO);
 	DEBUG("dminfo = %"PRIx32"\n", dminfo);
 	uint8_t dmversion = ((dminfo >> 4) & 0xc) | (dminfo & 3);
 	DEBUG("dminfo = %"PRIx32"\n", dminfo);
@@ -504,14 +566,14 @@ bool riscv_011_init(uint8_t jd_index, uint32_t idcode, uint32_t dtmcontrol) {
 		return false;
 
 #if defined(ENABLE_DEBUG) && defined(PLATFORM_HAS_DEBUG)
-	dtm.dramsize = (dminfo >> 10) & 0x3f;
-	DEBUG("\tdramsize = %d (%d bytes)\n", dtm.dramsize, (dtm.dramsize + 1) * 4);
+	dtm.v011.dramsize = (dminfo >> 10) & 0x3f;
+	DEBUG("\tdramsize = %d (%d bytes)\n", dtm.v011.dramsize, (dtm.v011.dramsize + 1) * 4);
 
 	riscv_dtm_write(&dtm, 0, 0xbeefcafe);
 	riscv_dtm_write(&dtm, 1, 0xdeadbeef);
 	DEBUG("%"PRIx32"\n", (uint32_t)riscv_dtm_read(&dtm, 0));
 	DEBUG("%"PRIx32"\n", (uint32_t)riscv_dtm_read(&dtm, 1));
-	for (int i = 0; i < 	dtm.dramsize + 1; i++) {
+	for (int i = 0; i < 	dtm.v011.dramsize + 1; i++) {
 		DEBUG("DebugRAM[%d] = %08"PRIx64"\n", i,
 			  riscv_dtm_read(&dtm, 0x400 + i*4));
 	}

@@ -18,6 +18,20 @@
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
+/*
+ * This file provides common implementation structs for RISC-V platforms.
+ * 
+ * The RISC-V debug spec has two versions in common use, 0.11 and 0.13. Things
+ * are not expected to diverge much after 0.13, so anything marked 'riscv' means
+ * '0.13 and above', whereas 0.11 has a separate implementation.
+ * 
+ * The only known device to use 0.11 is the SiFive FE310g000 (which also happens
+ * to be the first generally-available RISC-V device).
+ * 
+ * 0.11 specifically means version 0.11nov12 (2016-11-12)
+ * 0.13 speciifcally means commit b4f1f43 (2017-06-08)
+ */
+
 #ifndef __RISCV_H
 #define __RISCV_H
 
@@ -25,5 +39,42 @@
 #include "target.h"
 
 void riscv_jtag_handler(uint8_t jd_index, uint32_t j_idcode);
+
+bool riscv_011_init(uint8_t jd_index, uint32_t idcode, uint32_t dtmcontrol);
+
+/**************************************
+*     Driver-private structs
+**************************************/
+
+struct riscv_dtm {
+	uint8_t dtm_index;
+	uint8_t version; /* As read from dmtcontrol */
+	uint8_t abits; /* Debug bus address bits (6 bits wide) */
+	uint8_t idle; /* Number of cycles required in run-test/idle */
+    uint32_t idcode;
+	bool error;
+	bool exception;
+	uint64_t lastdbus;
+	bool halt_requested;
+	uint32_t saved_s1;
+    union {
+        struct {
+            uint8_t dramsize; /* Size of debug ram in words - 1 */
+        } v011;
+        struct {
+            uint8_t progsize;
+            uint8_t datacount;
+        } v013;
+    };
+};
+
+/**************************************
+*     GDB Target Descriptions
+**************************************/
+static const char tdesc_rv32[] =
+"<?xml version=\"1.0\"?>"
+"<target>"
+"  <architecture>riscv:rv32</architecture>"
+"</target>";
 
 #endif
