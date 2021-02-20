@@ -52,11 +52,11 @@ struct riscv_dtm {
 	uint8_t abits; /* Debug bus address bits (6 bits wide) */
 	uint8_t idle; /* Number of cycles required in run-test/idle */
     uint32_t idcode;
+	uint64_t lastdbus;
+	uint32_t saved_s1;
 	bool error;
 	bool exception;
-	uint64_t lastdbus;
 	bool halt_requested;
-	uint32_t saved_s1;
     union {
         struct {
             uint8_t dramsize; /* Size of debug ram in words - 1 */
