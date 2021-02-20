@@ -68,7 +68,7 @@ static uint32_t riscv_dtm_low_access(struct riscv_dtm *dtm, uint64_t dmi)
 		return 0;
 
 	uint64_t ret = 0;
-	/* Do not smash the stack is abits has gone astray!*/
+	/* Do not smash the stack if abits has gone astray!*/
 	if (dtm->abits > (64-DTM_DMI_ADDRESS_OFFSET)) {
 		DEBUG("Abits overflow in  riscv_dtm_low_access: %d\n", dtm->abits);
 		return 0;
@@ -77,6 +77,7 @@ retry:
 	DEBUG("out %"PRIx64"\n", dmi);
 	jtag_dev_shift_dr(&jtag_proc, dtm->dtm_index, (void*)&ret, (const void*)&dmi,
 					  DTM_DMI_ADDRESS_OFFSET + dtm->abits);
+	DEBUG("in %"PRIx64"\n", ret);
 	switch (GET_FIELD(ret, DTM_DMI_OP)) {
 	case DMI_RES_TOOSOON:
 		riscv_dtm_reset(dtm);
@@ -86,7 +87,7 @@ retry:
 		                  (void*)&ret, (const void*)&dtm->lastdbus,
 		                  dtm->abits + DTM_DMI_ADDRESS_OFFSET);
 		DEBUG("in %"PRIx64"\n", ret);
-		jtag_proc.jtagtap_tms_seq(0, dtm->idle);
+		jtag_proc.jtagtap_tms_seq(0, dtm->idle++);
 		goto retry;
 	case DMI_RES_SUCCESS:
 		dtm->lastdbus = dmi;
@@ -97,7 +98,9 @@ retry:
 		dtm->error = true;
 		return 0;
 	}
-	jtag_proc.jtagtap_tms_seq(0, dtm->idle);
+	if ((GET_FIELD(dmi, DTM_DMI_OP) != DMI_OP_NOP) && dtm->idle) {
+		jtag_proc.jtagtap_tms_seq(0, dtm->idle - 1);
+	}
 	return GET_FIELD(ret, DTM_DMI_DATA);
 }
 
