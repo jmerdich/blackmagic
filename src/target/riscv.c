@@ -104,10 +104,35 @@ retry:
 	return GET_FIELD(ret, DTM_DMI_DATA);
 }
 
-static uint64_t riscv_dtm_read(struct riscv_dtm *dtm, uint32_t addr)
+static uint32_t riscv_dtm_read(struct riscv_dtm *dtm, uint32_t addr)
 {
 	riscv_dtm_low_access(dtm, ((uint64_t)addr << DTM_DMI_ADDRESS_OFFSET) | DMI_OP_READ);
 	return riscv_dtm_low_access(dtm, DMI_OP_NOP);
+}
+
+static void riscv_dtm_write(struct riscv_dtm *dtm, uint32_t addr, uint32_t data)
+{
+	riscv_dtm_low_access(dtm, ((uint64_t)addr << DTM_DMI_ADDRESS_OFFSET) |
+	                          ((uint64_t)data << DTM_DMI_DATA_OFFSET) |
+							  DMI_OP_WRITE);
+}
+
+static void riscv_reset_target(target* t) {
+	struct riscv_dtm* dtm = (struct riscv_dtm*)t->priv;
+	DEBUG("Sending device/hart0 reset...\n");
+	riscv_dtm_write(dtm, DMI_DMCONTROL, DMI_DMCONTROL_NDMRESET |
+	                                    DMI_DMCONTROL_HARTRESET|
+										DMI_DMCONTROL_DMACTIVE |
+										DMI_DMCONTROL_HALTREQ);
+	riscv_dtm_write(dtm, DMI_DMCONTROL, DMI_DMCONTROL_DMACTIVE |
+	                                    DMI_DMCONTROL_HALTREQ);
+	uint32_t dmcontrol;
+	do {
+		dmcontrol = riscv_dtm_read(dtm, DMI_DMCONTROL);
+		DEBUG("Waiting for reset (dmcontrol=%0x08x)\n", dmcontrol);
+	} while ((GET_FIELD(dmcontrol, DMI_DMCONTROL_HARTRESET) != 0) ||
+	         (GET_FIELD(dmcontrol, DMI_DMCONTROL_NDMRESET) != 0));
+	DEBUG("Device has reset!\n");
 }
 
 bool riscv_013_init(uint8_t jd_index, uint32_t j_idcode, uint32_t dtmcs) {
@@ -159,6 +184,9 @@ bool riscv_013_init(uint8_t jd_index, uint32_t j_idcode, uint32_t dtmcs) {
 	t->driver = "RISC-V 0.13";
 	t->regs_size = 33 * 4;
 	t->tdesc = tdesc_rv32;
+
+	t->reset = riscv_reset_target;
+
 /*
 	t->mem_read = riscv_mem_read;
 	t->mem_write = riscv_mem_write;
@@ -167,7 +195,6 @@ bool riscv_013_init(uint8_t jd_index, uint32_t j_idcode, uint32_t dtmcs) {
 	t->check_error = riscv_check_error;
 	t->reg_read = riscv_reg_read;
 	t->reg_write = riscv_reg_write;
-	t->reset = riscv_reset;
 	t->halt_request = riscv_halt_request;
 	t->halt_poll = riscv_halt_poll;
 	t->halt_resume = riscv_halt_resume;
