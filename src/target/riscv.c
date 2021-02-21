@@ -185,7 +185,7 @@ static ABSTRACTCS_CMDERR_T riscv_abstract_reg_read32(struct riscv_dtm *dtm, uint
 	if (dtm->v013.datacount == 0) {
 		return ABSTRACTCS_CMDERR_NOT_SUPPORTED;
 	}
-	DEBUG("Reading abstract register 0x%04x", absreg);
+	DEBUG("Reading abstract register 0x%04x\n", absreg);
 	uint32_t reg_cmd = SET_FIELD(2 /* = 32b */, AC_ACCESS_REGISTER_SIZE) |
 	                   SET_FIELD(absreg, AC_ACCESS_REGISTER_REGNO) |
 					   AC_ACCESS_REGISTER_TRANSFER;
@@ -194,9 +194,8 @@ static ABSTRACTCS_CMDERR_T riscv_abstract_reg_read32(struct riscv_dtm *dtm, uint
 	ABSTRACTCS_CMDERR_T err = riscv_abstract_wait(dtm);
 	if (err == ABSTRACTCS_CMDERR_NONE) {
 		*data = riscv_dtm_read(dtm, DMI_DATA0);
-		DEBUG("... got %04x", *data);
+		DEBUG("... got %04x\n", *data);
 	}
-	DEBUG("\n");
 	return err;
 }
 
