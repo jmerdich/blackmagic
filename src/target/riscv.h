@@ -57,11 +57,19 @@ struct riscv_dtm {
 	bool error;
 	bool exception;
 	bool halt_requested;
+    struct {
+        uint32_t absCsrAccess : 1;
+        uint32_t absOtherRegAccess : 1;
+        uint32_t absQuickAccess : 1;
+        uint32_t absMemAccess : 1;
+        uint32_t reserved : 28;
+    } detectedFeatures;
     union {
         struct {
             uint8_t dramsize; /* Size of debug ram in words - 1 */
         } v011;
         struct {
+            uint32_t last_dcsr;
             uint8_t progsize;
             uint8_t datacount;
         } v013;
