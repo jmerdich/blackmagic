@@ -52,12 +52,37 @@ typedef enum {
 	ABSTRACTCS_CMDERR_OTHER = 7,
 } ABSTRACTCS_CMDERR_T;
 
+#define RV_NUM_GPRS 32
+#define RV_NUM_FP 32
+#define RV_NUM_CSR 4096
+
 #define ABSTRACT_GPR_START 0x1000
+#define ABSTRACT_FP_START  0x1020
 typedef enum {
 	RV_GPR_x0 = 0,
 	RV_GPR_s0 = 8
 	// and much more
+
 } RV_GPR_T;
+
+typedef enum {
+	RV_DREG_FIRST_GPR = 0,
+	RV_DREG_x0 = RV_DREG_FIRST_GPR + RV_GPR_x0,
+	RV_DREG_s0 = RV_DREG_FIRST_GPR + RV_GPR_s0,
+	RV_DREG_LAST_GPR = RV_DREG_FIRST_GPR + RV_NUM_GPRS - 1,
+
+	RV_DREG_PC = 32,
+
+	RV_DREG_FIRST_FP = 33,
+	RV_DREG_LAST_FP = RV_DREG_FIRST_FP + RV_NUM_FP - 1,
+
+	RV_DREG_FIRST_CSR = 65,
+	RV_DREG_LAST_CSR = RV_DREG_FIRST_CSR + RV_NUM_CSR - 1,
+
+	RV_DREG_PRIV = 4161,
+
+	RV_DREG_COUNT
+} RV_DREG_T; // Debugger (GDB) Register numbers
 
 #define GET_FIELD(v, name) ((v & name) >> name##_OFFSET)
 #define SET_FIELD(v, name) ((v << name##_OFFSET) & name)
@@ -267,6 +292,56 @@ static bool riscv_csr_read32(struct riscv_dtm *dtm, uint16_t csr, uint32_t* data
 	return true;
 }
 
+static bool riscv_csr_write32(struct riscv_dtm *dtm, uint16_t csr, uint32_t data) {
+	if (dtm->detectedFeatures.absCsrAccess)
+	{
+		// If we can, pull it directly
+		ABSTRACTCS_CMDERR_T res = riscv_abstract_reg_write32(dtm, csr, data);
+
+		switch (res) {
+			case ABSTRACTCS_CMDERR_NONE:
+				return true;
+			case ABSTRACTCS_CMDERR_NOT_SUPPORTED:
+				dtm->detectedFeatures.absCsrAccess = false;
+				return riscv_csr_write32(dtm, csr, data);
+			default:
+				DEBUG("Got error %d accessing csr %04x via abstract reg\n", res, csr);
+				return false;
+		}
+	}
+	assert(dtm->v013.progsize >= 1);
+	assert(dtm->v013.datacount >= 1);
+
+	uint32_t saved_s0; 
+	ABSTRACTCS_CMDERR_T err = riscv_abstract_reg_read32(dtm, ABSTRACT_GPR_START + RV_GPR_s0, &saved_s0);
+	if (err) {
+		DEBUG("Error: failed to save s0 (code %d).\n", err);
+		return false;
+	}
+
+	err = riscv_abstract_reg_write32(dtm, ABSTRACT_GPR_START + RV_GPR_s0, data);
+	if (err) {
+		DEBUG("Error: failed to write csr to staging reg (code %d).\n", err);
+		return false;
+	}
+
+	// csrw 0x000, s0
+	uint32_t csrs = 0x00041073 | (csr << 20);
+	err = riscv_abstract_exec(dtm, &csrs, 1);
+	if (err) {
+		DEBUG("Error: failed to execute code to write csr (code %d).\n", err);
+		return false;
+	}
+
+	err = riscv_abstract_reg_write32(dtm, ABSTRACT_GPR_START + RV_GPR_s0, saved_s0);
+	if (err) {
+		DEBUG("Error: failed to restore s0 (code %d).\n", err);
+		return false;
+	}
+
+	return true;
+}
+
 static bool riscv_csr_setbits(struct riscv_dtm *dtm, uint16_t csr, uint32_t mask) {
 	assert(dtm->v013.progsize >= 1);
 	assert(dtm->v013.datacount >= 1);
@@ -434,6 +509,68 @@ static void riscv_detach(target *t)
 	target_halt_resume(t, false);
 }
 
+ssize_t riscv_reg_read(target *t, int reg, void* data, size_t max) {
+	struct riscv_dtm* dtm = (struct riscv_dtm*)t->priv;
+	if (max < 4) {
+		return -1;
+	}
+	uint32_t out = 0;
+	bool success = false;
+
+	if (reg >= RV_DREG_FIRST_GPR && reg <= RV_DREG_LAST_GPR) {
+		success = riscv_abstract_reg_read32(dtm, reg + ABSTRACT_GPR_START, &out);
+	} else if (reg == RV_DREG_PC) {
+		success = riscv_csr_read32(dtm, CSR_DPC, &out);
+	} else if (reg >= RV_DREG_FIRST_FP && reg <= RV_DREG_LAST_FP) {
+		success = false; // not implemented yet.
+	} else if (reg >= RV_DREG_FIRST_CSR && reg <= RV_DREG_LAST_CSR) {
+		success = riscv_csr_read32(dtm, reg - RV_DREG_FIRST_CSR, &out);
+	} else if (reg == RV_DREG_PRIV) {
+		success = true;
+		out = GET_FIELD(dtm->v013.last_dcsr, CSR_DCSR_PRV);
+	}
+
+	if (success) {
+		memcpy(data, &out, sizeof(out));
+		return 4;
+	} else {
+		return -1;
+	}
+}
+
+ssize_t riscv_reg_write(target *t, int reg, const void* data, size_t size) {
+	struct riscv_dtm* dtm = (struct riscv_dtm*)t->priv;
+	if (size < 4) {
+		return -1;
+	}
+	uint32_t out = 0;
+	bool success = false;
+	memcpy(&out, data, sizeof(out));
+
+	if (reg >= RV_DREG_FIRST_GPR && reg <= RV_DREG_LAST_GPR) {
+		success = riscv_abstract_reg_write32(dtm, reg + ABSTRACT_GPR_START, out);
+	} else if (reg == RV_DREG_PC) {
+		success = riscv_csr_write32(dtm, CSR_DPC, out);
+	} else if (reg >= RV_DREG_FIRST_FP && reg <= RV_DREG_LAST_FP) {
+		success = false; // not implemented yet.
+	} else if (reg >= RV_DREG_FIRST_CSR && reg <= RV_DREG_LAST_CSR) {
+		success = riscv_csr_write32(dtm, reg - RV_DREG_FIRST_CSR, out);
+	} else if (reg == RV_DREG_PRIV) {
+		uint32_t new_dcsr = (dtm->v013.last_dcsr & ~CSR_DCSR_PRV) |
+							SET_FIELD(GET_FIELD(out, VIRT_PRIV_PRV), CSR_DCSR_PRV);
+		success = riscv_csr_write32(dtm, CSR_DCSR, new_dcsr);
+		if (success) {
+			dtm->v013.last_dcsr = new_dcsr;
+		}
+	}
+
+	if (success) {
+		return 4;
+	} else {
+		return -1;
+	}
+}
+
 bool riscv_013_init(uint8_t jd_index, uint32_t j_idcode, uint32_t dtmcs) {
 	struct riscv_dtm dtm = {};
 	dtm.dtm_index = jd_index;
@@ -506,13 +643,13 @@ bool riscv_013_init(uint8_t jd_index, uint32_t j_idcode, uint32_t dtmcs) {
 	t->halt_resume = riscv_halt_resume;
 	t->attach = riscv_attach;
 	t->detach = riscv_detach;
+	t->reg_read = riscv_reg_read;
+	t->reg_write = riscv_reg_write;
 
 /*
 	t->mem_read = riscv_mem_read;
 	t->mem_write = riscv_mem_write;
 	t->check_error = riscv_check_error;
-	t->reg_read = riscv_reg_read;
-	t->reg_write = riscv_reg_write;
 	t->breakwatch_set = riscv_breakwatch_set;
 	t->breakwatch_clear = riscv_breakwatch_clear;
 */
