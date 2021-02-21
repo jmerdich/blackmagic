@@ -65,7 +65,9 @@ struct riscv_dtm {
         uint32_t absOtherRegAccess : 1;
         uint32_t absQuickAccess : 1;
         uint32_t absMemAccess : 1;
-        uint32_t reserved : 28;
+        uint32_t autoExecProg : 1;
+        uint32_t autoExecData : 1;
+        uint32_t reserved : 26;
     } detectedFeatures;
     union {
         struct {

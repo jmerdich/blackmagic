@@ -60,7 +60,8 @@ typedef enum {
 #define ABSTRACT_FP_START  0x1020
 typedef enum {
 	RV_GPR_x0 = 0,
-	RV_GPR_s0 = 8
+	RV_GPR_s0 = 8,
+	RV_GPR_s1 = 9
 	// and much more
 
 } RV_GPR_T;
@@ -84,8 +85,8 @@ typedef enum {
 	RV_DREG_COUNT
 } RV_DREG_T; // Debugger (GDB) Register numbers
 
-#define GET_FIELD(v, name) ((v & name) >> name##_OFFSET)
-#define SET_FIELD(v, name) ((v << name##_OFFSET) & name)
+#define GET_FIELD(v, name) (((v) & name) >> name##_OFFSET)
+#define SET_FIELD(v, name) (((v) << name##_OFFSET) & name)
 
 #include <assert.h>
 
@@ -218,7 +219,7 @@ static ABSTRACTCS_CMDERR_T riscv_abstract_reg_write32(struct riscv_dtm *dtm, uin
 
 
 static ABSTRACTCS_CMDERR_T riscv_abstract_exec(struct riscv_dtm *dtm,
-											   uint32_t* prog,
+											   const uint32_t* prog,
 											   uint8_t progsizedw) {
 	if (dtm->v013.progsize < progsizedw + 1) {
 		return ABSTRACTCS_CMDERR_NOT_SUPPORTED;
@@ -613,6 +614,196 @@ ssize_t riscv_reg_write(target *t, int reg, const void* data, size_t size) {
 	}
 }
 
+bool riscv_asm_mem_read(struct riscv_dtm *dtm, void* dest,  target_addr src, size_t len) {
+	assert(dtm->v013.progsize >= 2);
+	assert(dtm->v013.datacount >= 1);
+
+	// Do a slightly-optimized version of unaligned memcpy, storing data in s0
+	// and addresses (incremented by asm) in s1
+
+	// lw s0, 0(s1)
+	// addi s1, s1, 4
+	const uint32_t lw[2] = {0x0004A403, 0x00448493};
+	// lh s0, 0(s1)
+	// addi s1, s1, 2
+	const uint32_t lh[2] = {0x00049403, 0x00248493};
+	// lb s0, 0(s1)
+	// addi s1, s1, 1
+	const uint32_t lb[2] = {0x00048403, 0x00148493};
+
+	uint32_t val = 0;
+	uint32_t saved_s0 = 0;
+	uint32_t saved_s1 = 0;
+
+	ABSTRACTCS_CMDERR_T err = riscv_abstract_reg_read32(dtm, ABSTRACT_GPR_START + RV_GPR_s0, &saved_s0);
+	if (err) {
+		DEBUG("Error: failed to save s0 (code %d).\n", err);
+		return false;
+	}
+	err = riscv_abstract_reg_read32(dtm, ABSTRACT_GPR_START + RV_GPR_s1, &saved_s1);
+	if (err) {
+		DEBUG("Error: failed to save s1 (code %d).\n", err);
+		return false;
+	}
+	err = riscv_abstract_reg_write32(dtm, ABSTRACT_GPR_START + RV_GPR_s1, src);
+	if (err) {
+		DEBUG("Error: failed to write address (code %d).\n", err);
+		return false;
+	}
+
+	// Step 1: use smaller reads until aligned
+	while ((src % sizeof(uint32_t) != 0) && (len > 0)) {
+		if (((src % sizeof(uint16_t)) == 0) && (len >= sizeof(uint16_t))) {
+			// read 16-bit
+			err = riscv_abstract_exec(dtm, lh, 2);
+			if (err) {
+				DEBUG("Error: failed to execute memcpy (code %d).\n", err);
+				return false;
+			}
+			err = riscv_abstract_reg_read32(dtm, ABSTRACT_GPR_START + RV_GPR_s0, &val);
+			if (err) {
+				DEBUG("Error: failed to read data from memcpy (code %d).\n", err);
+				return false;
+			}
+			memcpy(dest, &val, sizeof(uint16_t));
+			dest += sizeof(uint16_t);
+			len -= sizeof(uint16_t);
+		} else {
+			// read 8-bit
+			err = riscv_abstract_exec(dtm, lb, 2);
+			if (err) {
+				DEBUG("Error: failed to execute memcpy (code %d).\n", err);
+				return false;
+			}
+			err = riscv_abstract_reg_read32(dtm, ABSTRACT_GPR_START + RV_GPR_s0, &val);
+			if (err) {
+				DEBUG("Error: failed to read data from memcpy (code %d).\n", err);
+				return false;
+			}
+			memcpy(dest, &val, sizeof(uint8_t));
+			dest += sizeof(uint8_t);
+			len -= sizeof(uint8_t);
+		}
+	}
+
+	if (len >= 4) {
+		// Step 2: read using native size for as long as possible
+		// (this is the 'hot' part, so doing things manually)
+		for (uint8_t i = 0; i < sizeof(lw)/sizeof(lw[0]); i++) {
+			riscv_dtm_write(dtm, DMI_PROGBUF0 + i, lw[i]);
+		}
+
+		// 0: 73 00 10 00                   ebreak
+		uint32_t ebreak = 0x00100073;
+		riscv_dtm_write(dtm, DMI_PROGBUF0 + (sizeof(lw)/sizeof(lw[0])), ebreak);
+
+		bool autoInc = false;
+		if (len >= 8 && dtm->detectedFeatures.autoExecData) {
+			riscv_dtm_write(dtm, DMI_ABSTRACTAUTO, SET_FIELD(1, DMI_ABSTRACTAUTO_AUTOEXECDATA));
+			autoInc = true;
+		}
+		uint32_t cmd = SET_FIELD(2, AC_ACCESS_REGISTER_SIZE) |
+						SET_FIELD(ABSTRACT_GPR_START + RV_DREG_s0, AC_ACCESS_REGISTER_REGNO) |
+						AC_ACCESS_REGISTER_TRANSFER |
+						AC_ACCESS_REGISTER_POSTEXEC;
+		uint32_t finalcmd = cmd & ~AC_ACCESS_REGISTER_POSTEXEC;
+
+		// get the first execution done, discard the data in it
+		// since it gets xfered before the code.
+		riscv_dtm_write(dtm, DMI_COMMAND, cmd);
+		err = riscv_abstract_wait(dtm);
+		if (err){
+			return false;
+		}
+
+		while (len >= 4) {
+			if (len >= 8) {
+				if (!autoInc) {
+					riscv_dtm_write(dtm, DMI_COMMAND, cmd);
+				}
+				err = riscv_abstract_wait(dtm);
+				if (err){
+					return false;
+				}
+				val = riscv_dtm_read(dtm, DMI_DATA0);
+			} else {
+				// Special handling for last read to not read past end
+				if (!autoInc) {
+					riscv_dtm_write(dtm, DMI_COMMAND, finalcmd);
+				}
+				err = riscv_abstract_wait(dtm);
+				if (err){
+					return false;
+				}
+				if (autoInc) {
+					riscv_dtm_write(dtm, DMI_ABSTRACTAUTO, 0);
+				}
+				val = riscv_dtm_read(dtm, DMI_DATA0);
+			}
+			memcpy(dest, &val, sizeof(uint32_t));
+			dest += sizeof(uint32_t);
+			len -= sizeof(uint32_t);
+		}
+	}
+
+	// Step 3: use smaller reads again for smaller-than-dword end
+	while (len > 0) {
+		if (len >= sizeof(uint16_t)) {
+			// read 16-bit
+			err = riscv_abstract_exec(dtm, lh, 2);
+			if (err) {
+				DEBUG("Error: failed to execute memcpy (code %d).\n", err);
+				return false;
+			}
+			err = riscv_abstract_reg_read32(dtm, ABSTRACT_GPR_START + RV_GPR_s0, &val);
+			if (err) {
+				DEBUG("Error: failed to read data from memcpy (code %d).\n", err);
+				return false;
+			}
+			memcpy(dest, &val, sizeof(uint16_t));
+			dest += sizeof(uint16_t);
+			len -= sizeof(uint16_t);
+		} else {
+			// read 8-bit
+			err = riscv_abstract_exec(dtm, lb, 2);
+			if (err) {
+				DEBUG("Error: failed to execute memcpy (code %d).\n", err);
+				return false;
+			}
+			err = riscv_abstract_reg_read32(dtm, ABSTRACT_GPR_START + RV_GPR_s0, &val);
+			if (err) {
+				DEBUG("Error: failed to read data from memcpy (code %d).\n", err);
+				return false;
+			}
+			memcpy(dest, &val, sizeof(uint8_t));
+			dest += sizeof(uint8_t);
+			len -= sizeof(uint8_t);
+		}
+	}
+
+	// Restore state
+	err = riscv_abstract_reg_write32(dtm, ABSTRACT_GPR_START + RV_GPR_s0, saved_s0);
+	if (err) {
+		DEBUG("Error: failed to restore s0 (code %d).\n", err);
+		return false;
+	}
+	err = riscv_abstract_reg_write32(dtm, ABSTRACT_GPR_START + RV_GPR_s1, saved_s1);
+	if (err) {
+		DEBUG("Error: failed to restore s1 (code %d).\n", err);
+		return false;
+	}
+
+	return true;
+}
+
+void riscv_mem_read(target *t, void* dest,  target_addr src, size_t len) {
+	struct riscv_dtm* dtm = (struct riscv_dtm*)t->priv;
+	bool result = riscv_asm_mem_read(dtm, dest, src, len);
+	if (!result) {
+		dtm->error |= true;
+	}
+}
+
 bool riscv_013_init(uint8_t jd_index, uint32_t j_idcode, uint32_t dtmcs) {
 	struct riscv_dtm dtm = {};
 	dtm.dtm_index = jd_index;
@@ -652,6 +843,15 @@ bool riscv_013_init(uint8_t jd_index, uint32_t j_idcode, uint32_t dtmcs) {
 	dtm.v013.datacount = GET_FIELD(abstractcs, DMI_ABSTRACTCS_DATACOUNT);
 	DEBUG("\tdatacount = %d\n", dtm.v013.datacount);
 
+	// Check if we support autoexec by writing and reading back bits
+	riscv_dtm_write(&dtm, DMI_ABSTRACTAUTO, DMI_ABSTRACTAUTO_AUTOEXECDATA |
+	                                        DMI_ABSTRACTAUTO_AUTOEXECPROGBUF);
+	uint32_t abstractauto = riscv_dtm_read(&dtm, DMI_ABSTRACTAUTO);
+	riscv_dtm_write(&dtm, DMI_ABSTRACTAUTO, 0);
+
+	dtm.detectedFeatures.autoExecData = (bool)GET_FIELD(abstractauto, DMI_ABSTRACTAUTO_AUTOEXECDATA);
+	dtm.detectedFeatures.autoExecProg = (bool)GET_FIELD(abstractauto, DMI_ABSTRACTAUTO_AUTOEXECPROGBUF);
+
 	// Some features can only be detected after they fail the first time
 	dtm.detectedFeatures.absCsrAccess = 1;
 	dtm.detectedFeatures.absOtherRegAccess = 1;
@@ -690,9 +890,9 @@ bool riscv_013_init(uint8_t jd_index, uint32_t j_idcode, uint32_t dtmcs) {
 	t->detach = riscv_detach;
 	t->reg_read = riscv_reg_read;
 	t->reg_write = riscv_reg_write;
+	t->mem_read = riscv_mem_read;
 
 /*
-	t->mem_read = riscv_mem_read;
 	t->mem_write = riscv_mem_write;
 	t->check_error = riscv_check_error;
 	t->breakwatch_set = riscv_breakwatch_set;
