@@ -423,6 +423,17 @@ static enum target_halt_reason riscv_halt_poll(target* t, target_addr* watch) {
 	}
 }
 
+static bool riscv_attach(target *t)
+{
+	target_halt_request(t);
+	return true;
+}
+
+static void riscv_detach(target *t)
+{
+	target_halt_resume(t, false);
+}
+
 bool riscv_013_init(uint8_t jd_index, uint32_t j_idcode, uint32_t dtmcs) {
 	struct riscv_dtm dtm = {};
 	dtm.dtm_index = jd_index;
@@ -493,12 +504,12 @@ bool riscv_013_init(uint8_t jd_index, uint32_t j_idcode, uint32_t dtmcs) {
 	t->halt_poll = riscv_halt_poll;
 	t->halt_request = riscv_halt_request;
 	t->halt_resume = riscv_halt_resume;
+	t->attach = riscv_attach;
+	t->detach = riscv_detach;
 
 /*
 	t->mem_read = riscv_mem_read;
 	t->mem_write = riscv_mem_write;
-	t->attach = riscv_attach;
-	t->detach = riscv_detach;
 	t->check_error = riscv_check_error;
 	t->reg_read = riscv_reg_read;
 	t->reg_write = riscv_reg_write;
