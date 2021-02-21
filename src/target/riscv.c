@@ -468,14 +468,13 @@ static void riscv_halt_resume(target* t, bool step) {
 	} while (GET_FIELD(dmstatus, DMI_DMSTATUS_ALLRESUMEACK) == 0);
 }
 
-static enum target_halt_reason riscv_halt_poll(target* t, target_addr* watch) {
-	(void)watch; // watchpoints not done, set it to hit addr when it is
-	struct riscv_dtm* dtm = (struct riscv_dtm*)t->priv;
-
+static enum target_halt_reason riscv_dtm_halt_poll(struct riscv_dtm *dtm) {
 	uint32_t halted_harts = riscv_dtm_read(dtm, DMI_HALTSUM);
 	if (halted_harts == 0) {
+		dtm->is_halted = false;
 		return TARGET_HALT_RUNNING;
 	}
+	dtm->is_halted = true;
 
 	uint32_t dcsr;
 	if (riscv_csr_read32(dtm, CSR_DCSR, &dcsr)) {
@@ -495,6 +494,50 @@ static enum target_halt_reason riscv_halt_poll(target* t, target_addr* watch) {
 		// Reg read failed?!?
 		return TARGET_HALT_ERROR;
 	}
+}
+
+void riscv_dtm_push_halt(struct riscv_dtm *dtm) {
+	if (dtm->halt_pushed_level == 0) {
+		if (dtm->is_halted) {
+			dtm->halt_pushed = 1;
+		} else {
+			riscv_dtm_write(dtm, DMI_DMCONTROL, DMI_DMCONTROL_DMACTIVE |
+												DMI_DMCONTROL_HALTREQ);
+			uint32_t dmstatus;
+			do {
+				dmstatus = riscv_dtm_read(dtm, DMI_DMSTATUS);
+			} while (GET_FIELD(dmstatus, DMI_DMSTATUS_ALLHALTED) == 0);
+
+			dtm->is_halted = 1;
+			dtm->halt_pushed = 0;
+		}
+	}
+	dtm->halt_pushed_level++;
+}
+
+void riscv_dtm_pop_halt(struct riscv_dtm *dtm) {
+	if (dtm->halt_pushed_level == 1) {
+		if (!dtm->halt_pushed) {
+			riscv_dtm_write(dtm, DMI_DMCONTROL, DMI_DMCONTROL_DMACTIVE |
+												DMI_DMCONTROL_HALTREQ);
+			uint32_t dmstatus;
+			do {
+				dmstatus = riscv_dtm_read(dtm, DMI_DMSTATUS);
+			} while (GET_FIELD(dmstatus, DMI_DMSTATUS_ALLHALTED) == 0);
+		}
+		dtm->is_halted = dtm->halt_pushed;
+	}
+	if (dtm->halt_pushed_level > 0) {
+		dtm->halt_pushed_level--;
+	} else {
+		DEBUG("No halt state to pop, mismatched push?\n");
+	}
+}
+
+static enum target_halt_reason riscv_halt_poll(target* t, target_addr* watch) {
+	(void)watch; // watchpoints not done, set it to hit addr when it is
+	struct riscv_dtm* dtm = (struct riscv_dtm*)t->priv;
+	return riscv_dtm_halt_poll(dtm);
 }
 
 static bool riscv_attach(target *t)
@@ -601,6 +644,7 @@ bool riscv_013_init(uint8_t jd_index, uint32_t j_idcode, uint32_t dtmcs) {
 		riscv_dtm_write(&dtm, DMI_DMCONTROL, 0x10000000 /* ackhavereset */ |
 		                                     DMI_DMCONTROL_DMACTIVE);
 	}
+	dtm.is_halted = (bool)riscv_dtm_read(&dtm, DMI_HALTSUM);
 
 	uint32_t abstractcs = riscv_dtm_read(&dtm, DMI_ABSTRACTCS);
 	dtm.v013.progsize = GET_FIELD(abstractcs, DMI_ABSTRACTCS_PROGSIZE);
@@ -613,10 +657,12 @@ bool riscv_013_init(uint8_t jd_index, uint32_t j_idcode, uint32_t dtmcs) {
 	dtm.detectedFeatures.absOtherRegAccess = 1;
 	dtm.detectedFeatures.absQuickAccess = 1;
 	dtm.detectedFeatures.absMemAccess = 1;
-	
+
+	riscv_dtm_push_halt(&dtm);	
 	// Initialize 'last' values to speed up RMW
 	riscv_csr_read32(&dtm, CSR_DCSR, &dtm.v013.last_dcsr);
 	DEBUG("\tdcsr = 0x%08x\n", dtm.v013.last_dcsr);
+	riscv_dtm_pop_halt(&dtm);	
 
 	/* Allocate and set up new target */
 	struct riscv_dtm* saved_dtm = malloc(sizeof(dtm));

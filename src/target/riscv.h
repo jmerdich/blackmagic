@@ -57,6 +57,9 @@ struct riscv_dtm {
 	bool error;
 	bool exception;
 	bool halt_requested;
+    bool is_halted;
+    bool halt_pushed;
+    uint8_t halt_pushed_level;
     struct {
         uint32_t absCsrAccess : 1;
         uint32_t absOtherRegAccess : 1;
