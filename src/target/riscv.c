@@ -652,6 +652,8 @@ static bool riscv_asm_mem_read(struct riscv_dtm *dtm, void* dest,  target_addr s
 	}
 
 	// Step 1: use smaller reads until aligned
+	// We need to keep track of 'src' for this part until aligned,
+	// but after that, the host code doesn't care and asm handles it.
 	while ((src % sizeof(uint32_t) != 0) && (len > 0)) {
 		if (((src % sizeof(uint16_t)) == 0) && (len >= sizeof(uint16_t))) {
 			// read 16-bit
@@ -667,6 +669,7 @@ static bool riscv_asm_mem_read(struct riscv_dtm *dtm, void* dest,  target_addr s
 			}
 			memcpy(dest, &val, sizeof(uint16_t));
 			dest += sizeof(uint16_t);
+			src += sizeof(uint16_t);
 			len -= sizeof(uint16_t);
 		} else {
 			// read 8-bit
@@ -682,6 +685,7 @@ static bool riscv_asm_mem_read(struct riscv_dtm *dtm, void* dest,  target_addr s
 			}
 			memcpy(dest, &val, sizeof(uint8_t));
 			dest += sizeof(uint8_t);
+			src += sizeof(uint8_t);
 			len -= sizeof(uint8_t);
 		}
 	}
@@ -804,6 +808,201 @@ static void riscv_mem_read(target *t, void* dest,  target_addr src, size_t len) 
 	}
 }
 
+
+static bool riscv_asm_mem_write(struct riscv_dtm *dtm, target_addr dest, const void* src, size_t len) {
+	assert(dtm->v013.progsize >= 2);
+	assert(dtm->v013.datacount >= 1);
+
+	// Do a slightly-optimized version of unaligned memcpy, storing data in s0
+	// and addresses (incremented by asm) in s1
+
+	// sw s0, 0(s1)
+	// addi s1, s1, 4
+	const uint32_t sw[2] = {0x00842023, 0x00448493};
+	// sh s0, 0(s1)
+	// addi s1, s1, 2
+	const uint32_t sh[2] = {0x00841023, 0x00248493};
+	// sb s0, 0(s1)
+	// addi s1, s1, 1
+	const uint32_t sb[2] = {0x00840023, 0x00148493};
+
+	uint32_t val = 0;
+	uint32_t saved_s0 = 0;
+	uint32_t saved_s1 = 0;
+
+	ABSTRACTCS_CMDERR_T err = riscv_abstract_reg_read32(dtm, ABSTRACT_GPR_START + RV_GPR_s0, &saved_s0);
+	if (err) {
+		DEBUG("Error: failed to save s0 (code %d).\n", err);
+		return false;
+	}
+	err = riscv_abstract_reg_read32(dtm, ABSTRACT_GPR_START + RV_GPR_s1, &saved_s1);
+	if (err) {
+		DEBUG("Error: failed to save s1 (code %d).\n", err);
+		return false;
+	}
+	err = riscv_abstract_reg_write32(dtm, ABSTRACT_GPR_START + RV_GPR_s1, dest);
+	if (err) {
+		DEBUG("Error: failed to write address (code %d).\n", err);
+		return false;
+	}
+
+	// Step 1: use smaller writes until aligned
+	// We need to keep track of 'dest' for this part until aligned,
+	// but after that, the host code doesn't care and asm handles it.
+	while ((dest % sizeof(uint32_t) != 0) && (len > 0)) {
+		if (((dest % sizeof(uint16_t)) == 0) && (len >= sizeof(uint16_t))) {
+			memcpy(&val, src, sizeof(uint16_t));
+			// write 16-bit
+			err = riscv_abstract_reg_write32(dtm, ABSTRACT_GPR_START + RV_GPR_s0, val);
+			if (err) {
+				DEBUG("Error: failed to write data for memcpy (code %d).\n", err);
+				return false;
+			}
+			err = riscv_abstract_exec(dtm, sh, 2);
+			if (err) {
+				DEBUG("Error: failed to execute memcpy (code %d).\n", err);
+				return false;
+			}
+			dest += sizeof(uint16_t);
+			src += sizeof(uint16_t);
+			len -= sizeof(uint16_t);
+		} else {
+			// write 8-bit
+			memcpy(&val, src, sizeof(uint8_t));
+			err = riscv_abstract_reg_write32(dtm, ABSTRACT_GPR_START + RV_GPR_s0, val);
+			if (err) {
+				DEBUG("Error: failed to write data for memcpy (code %d).\n", err);
+				return false;
+			}
+			err = riscv_abstract_exec(dtm, sb, 2);
+			if (err) {
+				DEBUG("Error: failed to execute memcpy (code %d).\n", err);
+				return false;
+			}
+			dest += sizeof(uint8_t);
+			src += sizeof(uint8_t);
+			len -= sizeof(uint8_t);
+		}
+	}
+
+	if (len >= 4) {
+		// Step 2: write using native size for as long as possible
+		// (this is the 'hot' part, so doing things manually)
+		for (uint8_t i = 0; i < sizeof(sw)/sizeof(sw[0]); i++) {
+			riscv_dtm_write(dtm, DMI_PROGBUF0 + i, sw[i]);
+		}
+
+		// 0: 73 00 10 00                   ebreak
+		uint32_t ebreak = 0x00100073;
+		riscv_dtm_write(dtm, DMI_PROGBUF0 + (sizeof(sw)/sizeof(sw[0])), ebreak);
+
+		// Load in the first dword
+		memcpy(&val, src, sizeof(uint32_t));
+		riscv_dtm_write(dtm, DMI_DATA0, val);
+
+		bool autoInc = false;
+		if (len >= 8 && dtm->detectedFeatures.autoExecData) {
+			riscv_dtm_write(dtm, DMI_ABSTRACTAUTO, SET_FIELD(1, DMI_ABSTRACTAUTO_AUTOEXECDATA));
+			autoInc = true;
+		}
+
+		// Copy a dword to s0, then execute the memory write in asm
+		uint32_t cmd = SET_FIELD(2, AC_ACCESS_REGISTER_SIZE) |
+						SET_FIELD(ABSTRACT_GPR_START + RV_DREG_s0, AC_ACCESS_REGISTER_REGNO) |
+						AC_ACCESS_REGISTER_TRANSFER |
+						AC_ACCESS_REGISTER_WRITE |
+						AC_ACCESS_REGISTER_POSTEXEC;
+
+		// get the first reg-write and memory-write execution done
+		riscv_dtm_write(dtm, DMI_COMMAND, cmd);
+		err = riscv_abstract_wait(dtm);
+		if (err){
+			return false;
+		}
+		src += sizeof(uint32_t);
+		len -= sizeof(uint32_t);
+
+		while (len >= 4) {
+			// Copy to data0 staging
+			memcpy(&val, src, sizeof(uint32_t));
+			riscv_dtm_write(dtm, DMI_DATA0, val);
+
+			// If autoexec isn't on, init transfer and actual write
+			if (!autoInc) {
+				riscv_dtm_write(dtm, DMI_COMMAND, cmd);
+			}
+			err = riscv_abstract_wait(dtm);
+			if (err){
+				return false;
+			}
+			src += sizeof(uint32_t);
+			len -= sizeof(uint32_t);
+		}
+
+		if (autoInc) {
+			// Clear autoexec
+			riscv_dtm_write(dtm, DMI_ABSTRACTAUTO, 0);
+		}
+	}
+
+	// Step 3: use smaller writes again for smaller-than-dword end
+	while (len > 0) {
+		if (len >= sizeof(uint16_t)) {
+			memcpy(&val, src, sizeof(uint16_t));
+			// write 16-bit
+			err = riscv_abstract_reg_write32(dtm, ABSTRACT_GPR_START + RV_GPR_s0, val);
+			if (err) {
+				DEBUG("Error: failed to write data for memcpy (code %d).\n", err);
+				return false;
+			}
+			err = riscv_abstract_exec(dtm, sh, 2);
+			if (err) {
+				DEBUG("Error: failed to execute memcpy (code %d).\n", err);
+				return false;
+			}
+			src += sizeof(uint16_t);
+			len -= sizeof(uint16_t);
+		} else {
+			// write 8-bit
+			memcpy(&val, src, sizeof(uint8_t));
+			err = riscv_abstract_reg_write32(dtm, ABSTRACT_GPR_START + RV_GPR_s0, val);
+			if (err) {
+				DEBUG("Error: failed to write data for memcpy (code %d).\n", err);
+				return false;
+			}
+			err = riscv_abstract_exec(dtm, sb, 2);
+			if (err) {
+				DEBUG("Error: failed to execute memcpy (code %d).\n", err);
+				return false;
+			}
+			src += sizeof(uint8_t);
+			len -= sizeof(uint8_t);
+		}
+	}
+
+	// Restore state
+	err = riscv_abstract_reg_write32(dtm, ABSTRACT_GPR_START + RV_GPR_s0, saved_s0);
+	if (err) {
+		DEBUG("Error: failed to restore s0 (code %d).\n", err);
+		return false;
+	}
+	err = riscv_abstract_reg_write32(dtm, ABSTRACT_GPR_START + RV_GPR_s1, saved_s1);
+	if (err) {
+		DEBUG("Error: failed to restore s1 (code %d).\n", err);
+		return false;
+	}
+
+	return true;
+}
+
+static void riscv_mem_write(target *t, target_addr dest, const void* src, size_t len) {
+	struct riscv_dtm* dtm = (struct riscv_dtm*)t->priv;
+	DEBUG("Error: writes not implemented!");
+	bool result = riscv_asm_mem_write(dtm, dest, src, len);
+	if (!result) {
+		dtm->error |= true;
+	}
+}
 static bool riscv_check_error(target *t) {
 	struct riscv_dtm* dtm = (struct riscv_dtm*)t->priv;
 	return dtm->error;
@@ -897,9 +1096,9 @@ bool riscv_013_init(uint8_t jd_index, uint32_t j_idcode, uint32_t dtmcs) {
 	t->reg_write = riscv_reg_write;
 	t->mem_read = riscv_mem_read;
 	t->check_error = riscv_check_error;
+	t->mem_write = riscv_mem_write;
 
 /*
-	t->mem_write = riscv_mem_write;
 	t->breakwatch_set = riscv_breakwatch_set;
 	t->breakwatch_clear = riscv_breakwatch_clear;
 */
