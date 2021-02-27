@@ -497,7 +497,7 @@ static enum target_halt_reason riscv_dtm_halt_poll(struct riscv_dtm *dtm) {
 	}
 }
 
-void riscv_dtm_push_halt(struct riscv_dtm *dtm) {
+static void riscv_dtm_push_halt(struct riscv_dtm *dtm) {
 	if (dtm->halt_pushed_level == 0) {
 		if (dtm->is_halted) {
 			dtm->halt_pushed = 1;
@@ -516,7 +516,7 @@ void riscv_dtm_push_halt(struct riscv_dtm *dtm) {
 	dtm->halt_pushed_level++;
 }
 
-void riscv_dtm_pop_halt(struct riscv_dtm *dtm) {
+static void riscv_dtm_pop_halt(struct riscv_dtm *dtm) {
 	if (dtm->halt_pushed_level == 1) {
 		if (!dtm->halt_pushed) {
 			riscv_dtm_write(dtm, DMI_DMCONTROL, DMI_DMCONTROL_DMACTIVE |
@@ -552,7 +552,7 @@ static void riscv_detach(target *t)
 	target_halt_resume(t, false);
 }
 
-ssize_t riscv_reg_read(target *t, int reg, void* data, size_t max) {
+static ssize_t riscv_reg_read(target *t, int reg, void* data, size_t max) {
 	struct riscv_dtm* dtm = (struct riscv_dtm*)t->priv;
 	if (max < 4) {
 		return -1;
@@ -581,7 +581,7 @@ ssize_t riscv_reg_read(target *t, int reg, void* data, size_t max) {
 	}
 }
 
-ssize_t riscv_reg_write(target *t, int reg, const void* data, size_t size) {
+static ssize_t riscv_reg_write(target *t, int reg, const void* data, size_t size) {
 	struct riscv_dtm* dtm = (struct riscv_dtm*)t->priv;
 	if (size < 4) {
 		return -1;
@@ -614,7 +614,7 @@ ssize_t riscv_reg_write(target *t, int reg, const void* data, size_t size) {
 	}
 }
 
-bool riscv_asm_mem_read(struct riscv_dtm *dtm, void* dest,  target_addr src, size_t len) {
+static bool riscv_asm_mem_read(struct riscv_dtm *dtm, void* dest,  target_addr src, size_t len) {
 	assert(dtm->v013.progsize >= 2);
 	assert(dtm->v013.datacount >= 1);
 
@@ -796,7 +796,7 @@ bool riscv_asm_mem_read(struct riscv_dtm *dtm, void* dest,  target_addr src, siz
 	return true;
 }
 
-void riscv_mem_read(target *t, void* dest,  target_addr src, size_t len) {
+static void riscv_mem_read(target *t, void* dest,  target_addr src, size_t len) {
 	struct riscv_dtm* dtm = (struct riscv_dtm*)t->priv;
 	bool result = riscv_asm_mem_read(dtm, dest, src, len);
 	if (!result) {
