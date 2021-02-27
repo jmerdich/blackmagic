@@ -804,6 +804,11 @@ static void riscv_mem_read(target *t, void* dest,  target_addr src, size_t len) 
 	}
 }
 
+static bool riscv_check_error(target *t) {
+	struct riscv_dtm* dtm = (struct riscv_dtm*)t->priv;
+	return dtm->error;
+}
+
 bool riscv_013_init(uint8_t jd_index, uint32_t j_idcode, uint32_t dtmcs) {
 	struct riscv_dtm dtm = {};
 	dtm.dtm_index = jd_index;
@@ -891,10 +896,10 @@ bool riscv_013_init(uint8_t jd_index, uint32_t j_idcode, uint32_t dtmcs) {
 	t->reg_read = riscv_reg_read;
 	t->reg_write = riscv_reg_write;
 	t->mem_read = riscv_mem_read;
+	t->check_error = riscv_check_error;
 
 /*
 	t->mem_write = riscv_mem_write;
-	t->check_error = riscv_check_error;
 	t->breakwatch_set = riscv_breakwatch_set;
 	t->breakwatch_clear = riscv_breakwatch_clear;
 */
