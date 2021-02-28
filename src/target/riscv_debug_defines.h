@@ -321,10 +321,10 @@
 #define CSR_TDATA3_DATA_LENGTH              XLEN
 #define CSR_TDATA3_DATA                     (((1L<<XLEN)-1) << CSR_TDATA3_DATA_OFFSET)
 #define CSR_MCONTROL                        0x7a1
-#define CSR_MCONTROL_TYPE_OFFSET            XLEN-4
+#define CSR_MCONTROL_TYPE_OFFSET            (XLEN-4)
 #define CSR_MCONTROL_TYPE_LENGTH            4
 #define CSR_MCONTROL_TYPE                   (0xfL << CSR_MCONTROL_TYPE_OFFSET)
-#define CSR_MCONTROL_DMODE_OFFSET           XLEN-5
+#define CSR_MCONTROL_DMODE_OFFSET           (XLEN-5)
 #define CSR_MCONTROL_DMODE_LENGTH           1
 #define CSR_MCONTROL_DMODE                  (0x1L << CSR_MCONTROL_DMODE_OFFSET)
 /*

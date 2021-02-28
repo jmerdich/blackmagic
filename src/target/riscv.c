@@ -29,6 +29,8 @@
 #include "target.h"
 #include "target_internal.h"
 #include "riscv.h"
+
+#define XLEN 32
 #include "riscv_debug_defines.h"
 
 // Enums for debug regs
@@ -87,6 +89,11 @@ typedef enum {
 
 #define GET_FIELD(v, name) (((v) & name) >> name##_OFFSET)
 #define SET_FIELD(v, name) (((v) << name##_OFFSET) & name)
+
+struct riscv_bp_priv {
+	uint32_t index;
+	uint32_t reserved[3]; // to ensure proper alignment
+};
 
 #include <assert.h>
 
@@ -1008,6 +1015,76 @@ static bool riscv_check_error(target *t) {
 	return dtm->error;
 }
 
+static int riscv_breakwatch_set(target *t, struct breakwatch *bp) {
+	struct riscv_dtm* dtm = (struct riscv_dtm*)t->priv;
+	struct riscv_bp_priv bp_priv = {};
+
+	uint32_t mcontrol = 0;
+
+	// First, build up the desired commands
+	switch (bp->type) {
+		case TARGET_BREAK_HARD:
+			mcontrol = SET_FIELD(2 /* addr/data match */, CSR_MCONTROL_TYPE) |
+				 	   CSR_MCONTROL_DMODE |
+					   SET_FIELD(1 /* enter debug mode */, CSR_MCONTROL_ACTION) |
+			           SET_FIELD(0, CSR_MCONTROL_MATCH) |
+					   CSR_MCONTROL_M |
+					   CSR_MCONTROL_S |
+					   CSR_MCONTROL_U |
+					   CSR_MCONTROL_EXECUTE;
+			break;
+		default:
+			DEBUG("Unimplemented breakpoint type!");
+			return -1;
+	}
+
+	riscv_dtm_push_halt(dtm);
+
+	// TODO: scan this instead of hardcode
+	bp_priv.index = 0;
+
+	bool ok = riscv_csr_write32(dtm, CSR_TSELECT, bp_priv.index);
+	if (!ok) { return -1; }
+	
+	ok = riscv_csr_write32(dtm, CSR_MCONTROL, mcontrol);
+	if (!ok) { return -1; }
+
+	uint32_t new_mcontrol;
+	ok = riscv_csr_read32(dtm, CSR_MCONTROL, &new_mcontrol);
+	if (!ok) { return -1; }
+
+	if (new_mcontrol != mcontrol) {
+		// failed to set it, clear it now
+		riscv_csr_write32(dtm, CSR_MCONTROL, 0);
+		return -1;
+	}
+
+	riscv_dtm_pop_halt(dtm);
+	memcpy(&bp->reserved, &bp_priv, sizeof(bp_priv));
+	return 0;
+}
+
+static int riscv_breakwatch_clear(target *t, struct breakwatch *bp) {
+	struct riscv_dtm* dtm = (struct riscv_dtm*)t->priv;
+
+	struct riscv_bp_priv bp_priv;
+	memcpy(&bp_priv, &bp->reserved, sizeof(bp_priv));
+
+	riscv_dtm_push_halt(dtm);
+	// TODO: save/restore tselect for usermode debuggers
+
+	// select the relevant trigger
+	bool ok = riscv_csr_write32(dtm, CSR_TSELECT, bp_priv.index);
+	if (!ok) { return -1; }
+
+	// clear it
+	ok = riscv_csr_write32(dtm, CSR_MCONTROL, 0);
+	if (!ok) { return -1; }
+
+	riscv_dtm_pop_halt(dtm);
+	return 0;
+}
+
 bool riscv_013_init(uint8_t jd_index, uint32_t j_idcode, uint32_t dtmcs) {
 	struct riscv_dtm dtm = {};
 	dtm.dtm_index = jd_index;
@@ -1098,9 +1175,9 @@ bool riscv_013_init(uint8_t jd_index, uint32_t j_idcode, uint32_t dtmcs) {
 	t->check_error = riscv_check_error;
 	t->mem_write = riscv_mem_write;
 
-/*
 	t->breakwatch_set = riscv_breakwatch_set;
 	t->breakwatch_clear = riscv_breakwatch_clear;
+/*
 */
 	return true;
 
